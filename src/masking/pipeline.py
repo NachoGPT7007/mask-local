@@ -173,6 +173,52 @@ def collect_files(source: pathlib.Path, dirs: OutputDirs) -> tuple[list[pathlib.
     return files, source
 
 
+# --------------------------------------------------------------------- 手动补词
+
+#: 用户手动输入的字面量词。不做任何启发式，逐字命中即脱。
+#:
+#: 用途：规则够不着、但用户一眼能认出来的词——最典型的是「阿某古某」这类
+#: 姓氏表里没有的音译名。把它放进这里，就不必去改姓氏库。
+#: 类型固定为 CUSTOM，engine 里 CUSTOM 优先级最高（110），会压过人名/地名，
+#: 所以用户显式指定的词不会被其他检测器抢走。
+class _InlineTermsDetector:
+    name = "user_terms"
+    order = 1  # 最先跑，先占住区间
+
+    def __init__(self, terms: Sequence[str]) -> None:
+        # 去过重、去过短（单字太容易误伤）、按长度降序（长词优先）
+        cleaned = {t.strip() for t in terms if t and len(t.strip()) >= 2}
+        self._terms: tuple[str, ...] = tuple(sorted(cleaned, key=len, reverse=True))
+
+    def detect(self, block: TextBlock, ctx: MatchContext) -> Sequence[Entity]:
+        hits: list[Entity] = []
+        text = block.text
+        if not text or not self._terms:
+            return hits
+        taken: list[tuple[int, int]] = []
+        for term in self._terms:
+            start = 0
+            while True:
+                idx = text.find(term, start)
+                if idx < 0:
+                    break
+                end = idx + len(term)
+                if not any(idx < e and end > s for s, e in taken):
+                    hits.append(
+                        Entity(
+                            type=EntityType.CUSTOM,
+                            text=term,
+                            start=idx,
+                            end=end,
+                            confidence=1.0,
+                            detector=self.name,
+                        )
+                    )
+                    taken.append((idx, end))
+                start = idx + 1
+        return hits
+
+
 # --------------------------------------------------------------------- 路由
 
 
@@ -594,8 +640,15 @@ def mask_path_detailed(
     dry_run: bool = False,
     write_report_file: bool = True,
     audit_output: bool = True,
+    vault: "Vault | None" = None,
+    extra_terms: Sequence[str] | None = None,
 ) -> MaskOutcome:
-    """完整流水线，返回带路径的 ``MaskOutcome``（CLI 用）。"""
+    """完整流水线，返回带路径的 ``MaskOutcome``（CLI 用）。
+
+    vault 传入已有映射表时进入「续跑」模式：同一原文复用原代号，
+    新实体从剩余词池取，映射表在输出里合并成一份。
+    extra_terms 是用户手动指定的必脱词，按 CUSTOM 类型处理（优先级最高）。
+    """
     source = pathlib.Path(input_path).expanduser().resolve()
     if not source.exists():
         raise PipelineError(f"输入路径不存在：{source}")
@@ -616,8 +669,19 @@ def mask_path_detailed(
     files, base = collect_files(source, dirs)
     keep_tree = bool((settings.rules.output or {}).get("keep_tree", True))
 
+    # 手动补词：用户预输入的必脱词，优先级最高（engine 里 CUSTOM=110）。
+    # 这是给「阿某古某」这类规则抓不到、但用户一眼能认出的词准备的入口。
+    if extra_terms:
+        active_detectors.insert(0, _InlineTermsDetector(extra_terms))
+
     result = RunResult(scope=dirs.scope)
-    allocator = PlaceholderAllocator(settings.lexicon, settings.rules, scope=dirs.scope)
+    # 续跑：传入已有映射表时从它恢复，同一原文拿回原代号、新实体不撞号。
+    if vault is not None:
+        allocator = PlaceholderAllocator.from_entries(
+            settings.lexicon, settings.rules, vault.entries, scope=dirs.scope
+        )
+    else:
+        allocator = PlaceholderAllocator(settings.lexicon, settings.rules, scope=dirs.scope)
     ctx = MatchContext(scope=dirs.scope)
     outcome = MaskOutcome(result=result, dirs=dirs, dry_run=dry_run)
 
@@ -659,9 +723,12 @@ def mask_path_detailed(
             if key.startswith("detector_error:"):
                 outcome.notes.append(f"检测器 {key.split(':', 1)[1]} 抛出异常 {count} 次，结果可能漏检，建议人工抽查。")
 
-    vault = Vault.from_entries(dirs.scope, result.entries)
+    # 注意变量名：不能再用 vault，它已经是入参（续跑时传进来的既有映射表）。
+    # result.entries 来自 allocator.entries——续跑时它已经包含恢复的旧条目 + 新增条目，
+    # 所以这里天然就是「合并后」的一份完整映射表。
+    out_vault = Vault.from_entries(dirs.scope, result.entries)
     if dry_run:
-        outcome.vault = vault
+        outcome.vault = out_vault
         outcome.notes.append("dry-run：未写出脱敏件、映射表与报告。")
         return outcome
 
@@ -672,8 +739,8 @@ def mask_path_detailed(
         except OSError:
             pass
         safe_scope = re.sub(r"[\\/:*?\"<>|\s]+", "_", dirs.scope).strip("._") or "case"
-        outcome.vault_path = vault.save(dirs.vault / f"{safe_scope}.json")
-        outcome.vault = vault
+        outcome.vault_path = out_vault.save(dirs.vault / f"{safe_scope}.json")
+        outcome.vault = out_vault
 
     if write_report_file:
         common = dict(
@@ -687,7 +754,7 @@ def mask_path_detailed(
         # 可交付报告：不含真名，可随脱敏件上传
         outcome.report_path = write_report(
             result,
-            vault,
+            out_vault,
             dirs.report_dir,
             report_name="脱敏报告.md",
             reveal_names=False,
@@ -697,7 +764,7 @@ def mask_path_detailed(
         # 复核清单：含真名与片段，只在 vault 目录，0600
         outcome.review_path = write_report(
             result,
-            vault,
+            out_vault,
             dirs.vault,
             report_name="复核清单.md",
             reveal_names=True,
@@ -715,9 +782,13 @@ def mask_path(
     dry_run: bool = False,
     detectors: Sequence[object] | None = None,
     handlers: Sequence[object] | None = None,
+    vault: "Vault | None" = None,
+    extra_terms: Sequence[str] | None = None,
 ) -> RunResult:
     """契约入口：脱敏一个文件或一个案件文件夹。
 
+    vault 传入已有映射表 → 续跑（多次脱密）；
+    extra_terms → 用户手动的必脱词。
     需要路径信息（CLI 展示）时用 ``mask_path_detailed``。
     """
     outcome = mask_path_detailed(
@@ -727,6 +798,8 @@ def mask_path(
         detectors=detectors,
         handlers=handlers,
         dry_run=dry_run,
+        vault=vault,
+        extra_terms=extra_terms,
     )
     return outcome.result
 

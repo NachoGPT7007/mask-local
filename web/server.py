@@ -447,6 +447,20 @@ class Handler(BaseHTTPRequestHandler):
         level = fields.get("level", "full")
         case_name = _safe_case_name(fields.get("case_name", ""))
 
+        # 手动补词：逗号/顿号/分号/换行都能分隔
+        extra_terms = [
+            t.strip() for t in re.split(r"[,，、;；\n]+", fields.get("terms", "")) if t.strip()
+        ]
+
+        # 续跑：用户可上传上次的 vault 包（zip），复用其中的代号
+        resume_zip = None
+        for field_name, filename, payload in files:
+            if field_name == "vault" or (filename or "").lower().endswith(".zip"):
+                resume_zip = payload
+                break
+        # vault 包不该被当成待脱敏文件
+        files = [f for f in files if not (f[1] or "").lower().endswith(".zip")]
+
         from masking.config import Settings  # 延迟导入，便于给出友好报错
         from masking.pipeline import mask_path
 
@@ -454,13 +468,46 @@ class Handler(BaseHTTPRequestHandler):
 
         tmp = pathlib.Path(tempfile.mkdtemp(prefix="mask-web-"))
         try:
-            # 输入目录名就是案件名：pipeline 用它作为脱敏作用域，
-            # 映射表、报告都会以这个名字落盘，用户下载后一眼能对上。
             in_dir = tmp / case_name
             out_dir = tmp / "out"
             in_dir.mkdir(parents=True, exist_ok=True)
 
+            # 解出续跑用的映射表（zip 里应有 *.json 与 .key）
+            resume_vault = None
+            if resume_zip:
+                from masking.vault import Vault, VaultError
+
+                vdir = tmp / "resume-vault"
+                vdir.mkdir(parents=True, exist_ok=True)
+                try:
+                    with zipfile.ZipFile(io.BytesIO(resume_zip)) as zf:
+                        for member in zf.namelist():
+                            base = pathlib.Path(member).name
+                            if base.endswith(".json") or base == ".key":
+                                (vdir / base).write_bytes(zf.read(member))
+                except zipfile.BadZipFile:
+                    self._json(HTTPStatus.BAD_REQUEST,
+                               {"ok": False, "error": "续跑用的映射表包不是有效 zip"})
+                    return
+                maps = sorted(vdir.glob("*.json"))
+                if maps and (vdir / ".key").exists():
+                    try:
+                        resume_vault = Vault.load(str(maps[0]))
+                    except VaultError as exc:
+                        self._json(HTTPStatus.BAD_REQUEST,
+                                   {"ok": False, "error": f"已有映射表无法读取：{exc}"})
+                        return
+
             converted_notes: list[str] = []
+            if resume_vault is not None:
+                converted_notes.append(
+                    f"续跑：已有 {len(resume_vault.entries)} 个实体，本次只给新实体分配代号"
+                )
+            if extra_terms:
+                converted_notes.append(
+                    "手动补词：" + "、".join(extra_terms[:8]) + ("…" if len(extra_terms) > 8 else "")
+                )
+
             for _field, filename, payload in files:
                 safe = pathlib.Path(filename).name  # 去掉客户端可能带来的路径
                 if not safe:
@@ -471,7 +518,13 @@ class Handler(BaseHTTPRequestHandler):
                 if new_path is not None and note:
                     converted_notes.append(f"{safe}：{note}")
 
-            run = mask_path(str(in_dir), out_dir=str(out_dir), settings=settings)
+            run = mask_path(
+                str(in_dir),
+                out_dir=str(out_dir),
+                settings=settings,
+                vault=resume_vault,
+                extra_terms=extra_terms or None,
+            )
 
             # 结果另存一份到 output/，便于用文件管理器取用
             OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)

@@ -149,6 +149,26 @@
       <input id="caseName" type="text" value="未命名案件"
              placeholder="例：2024民初1234，用于输出目录与映射表命名" />
     </div>
+
+    <div style="margin-top:16px">
+      <label for="terms" class="muted" style="display:block;margin-bottom:6px">
+        指定必脱词（可选）——一行一个，或逗号分隔；这些词逐字命中即脱，优先级最高
+      </label>
+      <textarea id="terms" rows="3"
+        placeholder="例：阿某古某&#10;买某提·某&#10;某个规则抓不到、但你一眼认出的名字"
+        style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:9px;
+               background:var(--bg);color:var(--ink);font-size:14px;font-family:inherit;
+               resize:vertical"></textarea>
+    </div>
+
+    <div class="casename" style="margin-top:16px">
+      <label for="resumeVault" class="muted" style="flex:0 0 96px">已有映射表</label>
+      <input type="file" id="resumeVault" accept=".zip" />
+    </div>
+    <p class="muted" style="margin:6px 0 0 106px;line-height:1.6">
+      可选。上传上次下载的 vault 包即可「续跑」：已有实体沿用原代号，只给新实体分配新词，
+      映射表合并成一份。不传则是全新一轮脱敏。
+    </p>
   </div>
 
   <div class="card mask-card">
@@ -283,6 +303,10 @@ go.onclick = async () => {
   fd.append('level', document.querySelector('input[name=level]:checked').value);
   fd.append('case_name', document.getElementById('caseName').value || '未命名案件');
   if (document.getElementById('ner').checked) fd.append('ner', '1');
+  const terms = document.getElementById('terms').value.trim();
+  if (terms) fd.append('terms', terms);
+  const rv = document.getElementById('resumeVault');
+  if (rv.files[0]) fd.append('vault', rv.files[0], rv.files[0].name);
 
   try {
     const res = await fetch('/api/mask', { method: 'POST', body: fd });

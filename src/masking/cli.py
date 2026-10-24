@@ -88,6 +88,29 @@ def cmd_mask(args: argparse.Namespace) -> int:
         _print_error(f"配置加载失败：{exc}\n请检查 --lexicon / --rules 指向的 YAML 是否存在且格式正确。")
         return 2
 
+    # 续跑：复用已有映射表，同一原文拿回原代号
+    resume_vault = None
+    if getattr(args, "vault", None):
+        from .vault import Vault, VaultError
+
+        try:
+            resume_vault = Vault.load(args.vault)
+        except VaultError as exc:
+            _print_error(f"映射表无法读取：{exc}")
+            return 2
+        print(f"续跑：已有 {len(resume_vault.entries)} 个实体，新实体接着分配代号")
+
+    # 手动补词：逗号 / 顿号 / 分号 / 换行都能分隔
+    extra_terms: list[str] = []
+    raw_terms = getattr(args, "terms", None)
+    if raw_terms:
+        import re as _re
+
+        extra_terms = [t.strip() for t in _re.split(r"[,，、;；\n]+", raw_terms) if t.strip()]
+        if extra_terms:
+            head = "、".join(extra_terms[:6]) + ("…" if len(extra_terms) > 6 else "")
+            print(f"手动补词：{len(extra_terms)} 个（{head}）")
+
     try:
         outcome = mask_path_detailed(
             args.path,
@@ -95,6 +118,8 @@ def cmd_mask(args: argparse.Namespace) -> int:
             settings=settings,
             dry_run=bool(args.dry_run),
             write_report_file=bool(args.report),
+            vault=resume_vault,
+            extra_terms=extra_terms,
         )
     except PipelineError as exc:
         _print_error(str(exc))
@@ -510,6 +535,16 @@ def build_parser() -> argparse.ArgumentParser:
     mask.add_argument("--dry-run", action="store_true", help="只检测不写文件，不生成脱敏件/映射表/报告")
     mask.add_argument("--report", dest="report", action="store_true", default=True, help="生成审计报告（默认开启）")
     mask.add_argument("--no-report", dest="report", action="store_false", help="不生成审计报告")
+    mask.add_argument(
+        "--vault",
+        help="续跑：传入已有加密映射表（vault/案件.json），复用其中的代号，"
+        "只给新实体分配新词。多次脱密时用它，否则会产生第二套映射让旧表失效。",
+    )
+    mask.add_argument(
+        "--terms",
+        help="手动补词：逗号 / 顿号 / 换行分隔的必脱词，逐字命中即脱，优先级最高。"
+        "用于「阿某古某」这类规则抓不到、但你能认出来的词。",
+    )
     mask.set_defaults(func=cmd_mask)
 
     restore = sub.add_parser("restore", help="把脱敏件里的代号回填成真名")
