@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# 本地网页界面入口。用法：./mask-web [--port 8765]
+# 启动后浏览器打开 http://127.0.0.1:8765
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+exec "$DIR/.venv/bin/python" "$DIR/web/server.py" "$@"

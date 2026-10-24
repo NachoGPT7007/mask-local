@@ -1,0 +1,25 @@
+# Python 环境与缓存
+.venv/
+__pycache__/
+*.pyc
+*.egg-info/
+.pytest_cache/
+
+# 真实案件材料与脱敏产物：绝不入库
+# samples/ 含真实案件文书（判决书、送达回证、证据清单）
+# output/ 是脱敏产物，仍源于真实案件
+# vault/   含案件明文与加密密钥
+samples/
+output/
+vault/
+
+# 时间戳快照
+*.bak-*
+*.bak
+*.tmp
+
+# 编辑器 / 系统
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

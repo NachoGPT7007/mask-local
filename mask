@@ -1,0 +1,21 @@
+#!/usr/bin/env bash
+# 脱敏命令行入口。
+#
+# 用法：
+#   ./mask <文件或案件文件夹> [选项]     等价于 mask 子命令（省略子命令名）
+#   ./mask mask   <路径> [选项]
+#   ./mask restore <文件> --vault <映射表>
+#   ./mask audit  <路径>
+#   ./mask doctor
+set -euo pipefail
+DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+export PYTHONPATH="$DIR/src${PYTHONPATH:+:$PYTHONPATH}"
+
+case "${1:-}" in
+  mask|restore|audit|doctor|""|--version|-h|--help)
+    exec "$DIR/.venv/bin/python" -m masking.cli "$@"
+    ;;
+  *)
+    exec "$DIR/.venv/bin/python" -m masking.cli mask "$@"
+    ;;
+esac
