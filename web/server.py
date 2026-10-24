@@ -274,17 +274,156 @@ class Handler(BaseHTTPRequestHandler):
         self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "未知路径"})
 
     def do_POST(self) -> None:  # noqa: N802
-        if self.path.split("?", 1)[0] != "/api/mask":
-            self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "未知接口"})
-            return
+        path = self.path.split("?", 1)[0]
         try:
-            self._handle_mask()
+            if path == "/api/mask":
+                self._handle_mask()
+            elif path == "/api/restore":
+                self._handle_restore()
+            else:
+                self._json(HTTPStatus.NOT_FOUND, {"ok": False, "error": "未知接口"})
         except Exception as exc:  # noqa: BLE001
             traceback.print_exc()
             self._json(
                 HTTPStatus.INTERNAL_SERVER_ERROR,
                 {"ok": False, "error": f"{type(exc).__name__}: {exc}"},
             )
+
+    # ---------------------------------------------------------------- 还原
+
+    def _handle_restore(self) -> None:
+        """把编辑过的脱敏件还原成真名。
+
+        输入是两个文件：
+          - 编辑后的脱敏件（docx/xlsx/pdf/txt）
+          - vault 包（zip，含加密映射表与 .key）
+
+        只替换代号与 XXX 掩码，其余文字原样保留——也就是
+        「【熊猫】AAA【金鱼】」被编辑成「【熊猫】BBB【金鱼】」后，
+        还原得到「张三BBB李四」。
+        """
+        length = int(self.headers.get("Content-Length") or 0)
+        if length <= 0:
+            self._json(HTTPStatus.BAD_REQUEST, {"ok": False, "error": "空请求"})
+            return
+        if length > MAX_UPLOAD:
+            self._json(HTTPStatus.REQUEST_ENTITY_TOO_LARGE,
+                       {"ok": False, "error": "文件过大（上限 512MB）"})
+            return
+
+        body = self.rfile.read(length)
+        ctype = self.headers.get("Content-Type", "")
+        files, _fields = parse_multipart(ctype, body)
+
+        target: tuple[str, bytes] | None = None
+        vault_zip: bytes | None = None
+        for _field, filename, payload in files:
+            safe = pathlib.Path(filename).name
+            if not safe:
+                continue
+            if safe.lower().endswith(".zip"):
+                vault_zip = payload
+            elif target is None:
+                target = (safe, payload)
+
+        if target is None:
+            self._json(HTTPStatus.BAD_REQUEST,
+                       {"ok": False, "error": "没有收到待还原的文件"})
+            return
+        if vault_zip is None:
+            self._json(HTTPStatus.BAD_REQUEST,
+                       {"ok": False, "error": "没有收到 vault 包（zip）"})
+            return
+
+        from masking.restore import RestoreError, restore_file
+        from masking.vault import Vault, VaultError
+
+        tmp = pathlib.Path(tempfile.mkdtemp(prefix="mask-restore-"))
+        try:
+            vault_dir = tmp / "vault"
+            vault_dir.mkdir(parents=True, exist_ok=True)
+            try:
+                with zipfile.ZipFile(io.BytesIO(vault_zip)) as zf:
+                    # 只解压映射表与密钥，其余忽略，避免压缩包夹带路径穿越
+                    for member in zf.namelist():
+                        base = pathlib.Path(member).name
+                        if not base or base.startswith("."):
+                            if base != ".key":
+                                continue
+                        if not (base.endswith(".json") or base == ".key"):
+                            continue
+                        (vault_dir / base).write_bytes(zf.read(member))
+            except zipfile.BadZipFile:
+                self._json(HTTPStatus.BAD_REQUEST,
+                           {"ok": False, "error": "vault 包不是有效的 zip"})
+                return
+
+            maps = sorted(p for p in vault_dir.glob("*.json"))
+            keys = sorted(vault_dir.glob(".key"))
+            if not maps:
+                self._json(HTTPStatus.BAD_REQUEST,
+                           {"ok": False, "error": "vault 包里没有映射表（*.json）"})
+                return
+            if not keys:
+                self._json(HTTPStatus.BAD_REQUEST,
+                           {"ok": False, "error": "vault 包里没有密钥（.key），无法解密映射表"})
+                return
+
+            try:
+                vault = Vault.load(str(maps[0]))
+            except VaultError as exc:
+                self._json(HTTPStatus.BAD_REQUEST,
+                           {"ok": False, "error": f"映射表无法读取：{exc}"})
+                return
+
+            src = tmp / target[0]
+            src.write_bytes(target[1])
+            out_dir = tmp / "out"
+            out_dir.mkdir(parents=True, exist_ok=True)
+            out = out_dir / f"{src.stem}_已还原{src.suffix}"
+
+            try:
+                restore_file(src, out, vault)
+            except RestoreError as exc:
+                self._json(HTTPStatus.BAD_REQUEST,
+                           {"ok": False, "error": f"还原失败：{exc}"})
+                return
+
+            if not out.exists():
+                self._json(HTTPStatus.INTERNAL_SERVER_ERROR,
+                           {"ok": False, "error": "还原后未找到输出文件"})
+                return
+
+            # 留一份到 output/，与脱敏产物一样可用文件管理器取用
+            OUTPUT_ROOT.mkdir(parents=True, exist_ok=True)
+            stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+            keep = OUTPUT_ROOT / f"{stamp}-已还原"
+            keep.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(out, keep / out.name)
+
+            zip_path = OUTPUT_ROOT / f"{stamp}-已还原.zip"
+            with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+                zf.write(out, out.name)
+
+            token = uuid.uuid4().hex
+            with _LOCK:
+                _DOWNLOADS[token] = (zip_path, datetime.now())
+            _cleanup_old_downloads()
+
+            wsl_path = str(keep)
+            win_path = "\\\\wsl.localhost\\Ubuntu" + wsl_path.replace("/", "\\")
+            self._json(
+                HTTPStatus.OK,
+                {
+                    "ok": True,
+                    "file": out.name,
+                    "download": f"/download/{token}",
+                    "path_hint": f"文件管理器：{win_path}\nWSL 路径：{wsl_path}",
+                    "note": "还原件含真实姓名，只留本地，不要上传到联网环境。",
+                },
+            )
+        finally:
+            shutil.rmtree(tmp, ignore_errors=True)
 
     # ---------------------------------------------------------------- 主流程
 

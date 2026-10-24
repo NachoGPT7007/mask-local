@@ -95,6 +95,18 @@
     word-break: break-all; margin-top: 12px;
   }
   .muted { color: var(--muted); font-size: 13px; }
+  .tabs { display: flex; gap: 6px; margin-bottom: 18px; }
+  .tab {
+    padding: 9px 20px; border-radius: 9px; border: 1px solid var(--line);
+    background: none; color: var(--muted); cursor: pointer; font-size: 14px;
+    font-family: inherit; transition: background .15s, color .15s, border-color .15s;
+  }
+  .tab:hover { border-color: var(--accent); color: var(--accent); }
+  .tab.active { background: var(--accent); color: #fff; border-color: var(--accent); }
+  .restore-card code {
+    background: var(--accent-soft); padding: 1px 5px; border-radius: 4px;
+    font-size: 12.5px; font-family: ui-monospace, Consolas, monospace;
+  }
   .casename { margin-top: 16px; display: flex; align-items: center; gap: 10px; }
   .casename label { flex: none; }
   .casename input {
@@ -119,7 +131,12 @@
   <h1>本地脱敏</h1>
   <p class="sub">Word / Excel / PDF 文书与证据 · 文件不出本机 · 脱敏后可直接交给法律工作台</p>
 
-  <div class="card">
+  <div class="tabs">
+    <button class="tab active" data-tab="mask">脱敏</button>
+    <button class="tab" data-tab="restore">还原</button>
+  </div>
+
+  <div class="card mask-card">
     <div class="drop" id="drop">
       <strong>把文件拖到这里，或点击选择</strong>
       <span>支持 .docx / .xlsx / .pdf / .txt，可一次选多个；扫描件会自动走 OCR</span>
@@ -134,7 +151,7 @@
     </div>
   </div>
 
-  <div class="card">
+  <div class="card mask-card">
     <fieldset>
       <legend>脱敏范围</legend>
       <div class="opts">
@@ -180,6 +197,29 @@
     <a class="dl secondary hidden" id="downloadVault" href="#">下载映射表与复核清单（含真名，仅供本地保存，勿上传）</a>
     <p class="vault-note" id="vaultNote"></p>
     <div class="path" id="path"></div>
+  </div>
+
+  <div class="card restore-card hidden">
+    <h3 style="margin:0 0 6px;font-size:17px">还原：把编辑过的脱敏件换回真名</h3>
+    <p class="muted" style="margin:0 0 18px;line-height:1.7">
+      上传「编辑后的脱敏件」和当初下载的「vault 包」。工具只替换【代号】与 XXX 掩码，
+      你改过的其他文字原样保留——<code>【熊猫】AAA【金鱼】</code> 改成
+      <code>【熊猫】BBB【金鱼】</code>，还原得到 <code>张三BBB李四</code>。
+    </p>
+
+    <div class="casename">
+      <label class="muted" style="flex:0 0 96px">待还原文件</label>
+      <input type="file" id="restoreFile" accept=".docx,.xlsx,.pdf,.txt" />
+    </div>
+    <div class="casename">
+      <label class="muted" style="flex:0 0 96px">vault 包</label>
+      <input type="file" id="restoreVault" accept=".zip" />
+    </div>
+
+    <button class="primary" id="doRestore" disabled style="margin-top:20px">开始还原</button>
+    <div class="status" id="restoreStatus"></div>
+    <a class="dl hidden" id="restoreDownload" href="#">下载还原件</a>
+    <div class="path hidden" id="restorePath"></div>
   </div>
 </div>
 
@@ -259,6 +299,7 @@ go.onclick = async () => {
 };
 
 function renderResult(d) {
+  hasMaskResult = true;
   const stats = document.getElementById('stats');
   stats.innerHTML = '';
   const items = [
@@ -319,6 +360,65 @@ function renderResult(d) {
   resultEl.classList.remove('hidden');
   resultEl.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
 }
+
+// ---------------------------------------------------------------- 页签
+
+let hasMaskResult = false;
+
+document.querySelectorAll('.tab').forEach(btn => {
+  btn.onclick = () => {
+    document.querySelectorAll('.tab').forEach(b => b.classList.toggle('active', b === btn));
+    const tab = btn.dataset.tab;
+    document.querySelectorAll('.mask-card').forEach(el => el.classList.toggle('hidden', tab !== 'mask'));
+    document.querySelectorAll('.restore-card').forEach(el => el.classList.toggle('hidden', tab !== 'restore'));
+    // 脱敏结果只在「脱敏」页签且确实跑过时显示
+    resultEl.classList.toggle('hidden', !(tab === 'mask' && hasMaskResult));
+  };
+});
+
+// ---------------------------------------------------------------- 还原
+
+const rFile = document.getElementById('restoreFile');
+const rVault = document.getElementById('restoreVault');
+const rBtn = document.getElementById('doRestore');
+const rStatus = document.getElementById('restoreStatus');
+
+function syncRestoreBtn() {
+  rBtn.disabled = !(rFile.files[0] && rVault.files[0]);
+}
+rFile.onchange = syncRestoreBtn;
+rVault.onchange = syncRestoreBtn;
+
+rBtn.onclick = async () => {
+  if (!(rFile.files[0] && rVault.files[0])) return;
+  rBtn.disabled = true;
+  rStatus.className = 'status';
+  rStatus.textContent = '正在还原，只替换代号与掩码，其余文字保持原样…';
+  document.getElementById('restoreDownload').classList.add('hidden');
+  document.getElementById('restorePath').classList.add('hidden');
+
+  const fd = new FormData();
+  fd.append('file', rFile.files[0], rFile.files[0].name);
+  fd.append('vault', rVault.files[0], rVault.files[0].name);
+
+  try {
+    const res = await fetch('/api/restore', { method: 'POST', body: fd });
+    const d = await res.json();
+    if (!d.ok) throw new Error(d.error || '还原失败');
+    rStatus.textContent = '完成：' + d.file;
+    const dl = document.getElementById('restoreDownload');
+    dl.href = d.download;
+    dl.classList.remove('hidden');
+    const p = document.getElementById('restorePath');
+    p.textContent = d.path_hint || '';
+    p.classList.remove('hidden');
+  } catch (err) {
+    rStatus.className = 'status err';
+    rStatus.textContent = '失败：' + err.message;
+  } finally {
+    rBtn.disabled = false;
+  }
+};
 </script>
 </body>
 </html>
