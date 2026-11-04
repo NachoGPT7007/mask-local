@@ -37,13 +37,25 @@ TOKEN_FILE = Path(
 )
 
 # 白名单：服务 id → systemd user unit。只允许这些，别的一律 404。
-UNITS = {
-    "decrypt": "mask-web.service",
+# 白名单：服务 id → (systemd user unit, 发行版或 None=本机)。
+# 目前所有服务都在 Ubuntu 本机；distro 槽位留给将来（跨发行版需经 wsl.exe 转发）。
+UNITS: dict[str, tuple[str, str | None]] = {
+    "decrypt": ("mask-web.service", None),
+    "obc": ("obc.service", None),
 }
+WSL_EXE = Path("/mnt/c/Windows/System32/wsl.exe")
 
 # 拉起后等待端口就绪的最大秒数（不阻塞太久，超时也返回 ok，让前端继续轮询健康探测）
 READY_TIMEOUT = float(os.environ.get("MASK_CONTROL_READY_TIMEOUT", "25"))
-READY_PORTS = {"decrypt": 8765}
+READY_PORTS = {"decrypt": 8765, "obc": 8420}
+
+# 一次性令牌来源：服务 id → (发行版, 日志路径)。
+# superagent 的 launchToken 每次进程启动都换，只能从它自己的启动日志里取最新的那条。
+TOKEN_SOURCES: dict[str, tuple[str, str]] = {
+    "superagent": ("FedoraLinux-44", "/home/nachogpt/.dsh/sa-judge.log"),
+    # 别名：门面的跳转路由用 /go/secretary，指向同一个实例
+    "secretary": ("FedoraLinux-44", "/home/nachogpt/.dsh/sa-judge.log"),
+}
 
 
 def read_token() -> str:
@@ -61,14 +73,27 @@ def systemctl_env() -> dict[str, str]:
     return env
 
 
-def run_systemctl(*args: str, timeout: float = 20.0) -> tuple[int, str]:
+def run_systemctl(*args: str, timeout: float = 20.0, distro: str | None = None) -> tuple[int, str]:
+    """在本机或指定 WSL 发行版里跑 systemctl --user。
+
+    distro=None 时就是普通的本机 user unit；给了发行版名就走 wsl.exe，
+    因为不同发行版的 /run/user/<uid>/bus 是分开的，本机 systemctl 看不见对方。
+    """
+    if distro:
+        if not WSL_EXE.exists():
+            return 127, f"找不到 wsl.exe：{WSL_EXE}"
+        argv = [str(WSL_EXE), "-d", distro, "--", "systemctl", "--user", *args]
+        env = None
+    else:
+        argv = ["systemctl", "--user", *args]
+        env = systemctl_env()
     try:
         proc = subprocess.run(
-            ["systemctl", "--user", *args],
+            argv,
             capture_output=True,
             text=True,
             timeout=timeout,
-            env=systemctl_env(),
+            env=env,
         )
         message = (proc.stdout + proc.stderr).strip()
         return proc.returncode, message
@@ -78,8 +103,33 @@ def run_systemctl(*args: str, timeout: float = 20.0) -> tuple[int, str]:
         return 127, f"无法执行 systemctl：{exc}"
 
 
-def unit_state(unit: str) -> dict:
-    code, out = run_systemctl("show", "-p", "ActiveState", "-p", "SubState", "-p", "ExecMainPID", unit)
+def read_launch_token(name: str, timeout: float = 15.0) -> str | None:
+    """从目标发行的日志里取最新的一次性令牌（`?token=...` 那一行的值）。
+
+    只读日志的最后一处匹配，不做任何写入；取不到就返回 None，让调用方决定降级。
+    """
+    spec = TOKEN_SOURCES.get(name)
+    if not spec:
+        return None
+    distro, log_path = spec
+    if not WSL_EXE.exists():
+        return None
+    script = (
+        f"grep 'token=' {log_path} 2>/dev/null | tail -1 | sed 's/.*token=//' | tr -d '[:space:]'"
+    )
+    try:
+        proc = subprocess.run(
+            [str(WSL_EXE), "-d", distro, "--", "bash", "-c", script],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError):
+        return None
+    token = (proc.stdout or "").strip()
+    return token or None
+
+
+def unit_state(unit: str, distro: str | None = None) -> dict:
+    code, out = run_systemctl("show", "-p", "ActiveState", "-p", "SubState", "-p", "ExecMainPID", unit, distro=distro)
     data = {"active": "unknown", "sub": "unknown", "pid": None}
     if code != 0:
         return data
@@ -159,6 +209,8 @@ class Handler(BaseHTTPRequestHandler):
         parts = [p for p in self.path.split("?")[0].split("/") if p]
         if len(parts) == 3 and parts[0] == "services":
             return parts[1], parts[2]
+        if len(parts) == 2 and parts[0] == "token":
+            return parts[1], "token"
         return None
 
     # ----- GET -----
@@ -167,17 +219,28 @@ class Handler(BaseHTTPRequestHandler):
             self._json(200, {"ok": True, "service": "mask-control"})
             return
         route = self._route()
+        if route and route[1] == "token":
+            if not self._authorized():
+                return
+            name = route[0]
+            token = read_launch_token(name)
+            if token is None:
+                self._json(404, {"ok": False, "error": f"取不到 {name} 的令牌（服务未启动或日志里没有）"})
+                return
+            self._json(200, {"ok": True, "name": name, "token": token})
+            return
         if not route or route[1] != "status":
             self._json(404, {"ok": False, "error": "未知路径"})
             return
         if not self._authorized():
             return
         service_id = route[0]
-        unit = UNITS.get(service_id)
-        if not unit:
+        spec = UNITS.get(service_id)
+        if not spec:
             self._json(404, {"ok": False, "error": f"不支持的服务：{service_id}"})
             return
-        state = unit_state(unit)
+        unit, distro = spec
+        state = unit_state(unit, distro)
         port = READY_PORTS.get(service_id)
         self._json(
             200,
@@ -200,17 +263,18 @@ class Handler(BaseHTTPRequestHandler):
             self._json(404, {"ok": False, "error": "未知路径"})
             return
         service_id, action = route
-        unit = UNITS.get(service_id)
-        if not unit:
+        spec = UNITS.get(service_id)
+        if not spec:
             self._json(404, {"ok": False, "error": f"不支持的服务：{service_id}"})
             return
+        unit, distro = spec
         if action not in ("start", "stop"):
             self._json(404, {"ok": False, "error": f"不支持的动作：{action}"})
             return
         if not self._authorized():
             return
 
-        code, message = run_systemctl(action, unit)
+        code, message = run_systemctl(action, unit, distro=distro)
         if code != 0:
             self._json(
                 500,
