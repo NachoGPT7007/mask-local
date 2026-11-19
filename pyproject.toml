@@ -8,8 +8,8 @@ version = "0.3.0"
 description = "法院实习材料的本地脱敏工具：Word / Excel / PDF 文书与证据"
 readme = "README.md"
 requires-python = ">=3.10"
-license = { text = "Proprietary" }
-authors = [{ name = "local" }]
+license = { text = "MIT" }
+authors = [{ name = "NachoGPT" }]
 
 # 运行期依赖与 .venv 中已装版本一致；不在本机联网环境重装也没关系，
 # 这些只是让 `pip install -e .` 能复现环境。
