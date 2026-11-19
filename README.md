@@ -290,14 +290,8 @@ cd ~/mask-local
 
 ---
 
-## 致谢
+## 设计来源
 
-- [PyMuPDF](https://pymupdf.readthedocs.io/) —— PDF 解析
-- [python-docx](https://python-docx.readthedocs.io/) —— Word 读写
-- [openpyxl](https://openpyxl.readthedocs.io/) —— Excel 读写
-- [PyYAML](https://pyyaml.org/) —— 词表配置
-- [cryptography](https://cryptography.io/) —— 真名映射的加密存储
-- [RapidOCR](https://github.com/RapidAI/RapidOCR) —— 扫描件与图片文字识别
-- [Pillow](https://python-pillow.org/) —— 图片处理
+本工具「不漏、可回填」的分工来自一个很具体的场景：法院实习接触的是未公开文书与当事人身份信息，任何一次云端 API 调用都构成对外提供且事后无法撤回。所以它的设计前提是不联网、原件只读、真名与代号分离存放。
 
-本工具的「不漏、可回填」分工来自一个很具体的场景：法院实习接触的是未公开文书与当事人身份信息，任何一次云端 API 调用都构成对外提供且事后无法撤回。所以它的设计前提是不联网、原件只读、真名与代号分离存放。
+第三方依赖见 `pyproject.toml`，不在此列。
