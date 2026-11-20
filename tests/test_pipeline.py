@@ -469,7 +469,7 @@ def test_audit_detects_id_injected_into_masked_text(sandbox: pathlib.Path, setti
 def test_scan_text_ignores_own_outputs(settings: Settings) -> None:
     """自编案号/代号是本次产物，不能被当成残留；真实泄露仍要报。"""
     rules = Rules(residual={"未脱敏案号": [r"\(2024\)甲法民初\d+号"]})
-    text = "案号(2024)甲法民初1号；另发现(2024)甲法民初1234号"
+    text = "案号(2024)甲法民初1号；另发现(2024)乙法民初1234号"
     assert scan_text(text, rules), "未排除时应当有命中"
     findings = scan_text(text, rules, ignore_values=["(2024)甲法民初1号"])
     assert findings == []
@@ -485,7 +485,7 @@ def test_scan_text_ignores_own_outputs(settings: Settings) -> None:
 def test_masked_case_no_is_not_treated_as_residual(sandbox: pathlib.Path, settings: Settings) -> None:
     """自编案号 (2024)甲法民初1号 不能被流水线判成 critical 残留。"""
     case = sandbox / "案号案件"
-    _make_docx(case / "判决书.docx", ("原告张三。(2024)甲法民初1234号",))
+    _make_docx(case / "判决书.docx", ("原告张三。(2024)乙法民初1234号",))
     outcome = _run_mask(case, sandbox, settings)
     file_result = outcome.result.files[0]
     assert file_result.ok, file_result.error
